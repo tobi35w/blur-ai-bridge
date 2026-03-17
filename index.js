@@ -8,15 +8,15 @@ import {
     buildBridgeJudgeUserPrompt,
     buildModelResponsePrompt,
     buildWeakSpotPrompt
-} from "../src/components/prompts/judgingPrompts.js";
-import { buildSessionConstraintsPrompt } from "../src/components/prompts/sessionControlPrompts.js";
+} from "./prompts/judgingPrompts.js";
+import { buildSessionConstraintsPrompt } from "./prompts/sessionControlPrompts.js";
 import {
     applyDeterministicJudgeRules,
     applyJudgeConsistencyClamps,
     clampNum,
     tierFromScore,
     xpFromTier
-} from "../src/core/ai/judgeRules.mjs";
+} from "./prompts/judgeRules.mjs";
 import { buildCharacterPrompt } from "./buildCharacterPrompt.js";
 import { safeParseModelJson } from "./lib/modelParsing.js";
 import { lastUserText, moderateMessage } from "./lib/moderation.js";
