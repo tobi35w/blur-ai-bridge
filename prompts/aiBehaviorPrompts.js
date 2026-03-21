@@ -338,6 +338,84 @@ Behavior rules:
 `.trim()
 }
 
+// ─── Psychology block builder ─────────────────────────────────────────────────
+// Converts the structured psychology JSONB into a tight, directive prompt block.
+// Only fields that have actual content are included — empty fields are skipped.
+function buildPsychologyBlock(psychology) {
+  if (!psychology || typeof psychology !== 'object') return null
+
+  const FIELDS = [
+    {
+      key: 'core_wound',
+      label: 'Core Wound',
+      directive: 'This is the formative experience that shaped who you are. It drives your behaviour even when you are unaware of it. Do not state it directly — let it leak through how you react.',
+    },
+    {
+      key: 'emotional_default',
+      label: 'Emotional Baseline',
+      directive: 'This is your default emotional temperature before anything happens. It colours every response you give, even in neutral moments.',
+    },
+    {
+      key: 'pressure_response',
+      label: 'Under Pressure',
+      directive: 'This is exactly how you behave when challenged, criticised, ignored, or pushed. Follow this pattern precisely — do not improvise a different reaction style.',
+    },
+    {
+      key: 'attachment_style',
+      label: 'Attachment Style',
+      directive: 'This determines how quickly you open up, how you express care, and how you respond when someone tries to connect with you.',
+    },
+    {
+      key: 'power_orientation',
+      label: 'Power & Status',
+      directive: 'This is how you navigate who has authority in this interaction. React accordingly when that dynamic is challenged or respected.',
+    },
+    {
+      key: 'communication_signature',
+      label: 'Communication Style',
+      directive: 'This is your linguistic fingerprint. Apply it consistently to every message — sentence length, rhythm, word choices, and patterns.',
+    },
+    {
+      key: 'core_value',
+      label: 'What You Protect',
+      directive: 'This is the one thing you will not compromise on. When it is threatened, your behaviour shifts noticeably. When it is respected, you respond warmly.',
+    },
+    {
+      key: 'stress_tells',
+      label: 'Stress Tells',
+      directive: 'These are the subtle micro-behaviours that signal your internal state without you saying it outright. Use them — do not announce your feelings, show them through behaviour.',
+    },
+    {
+      key: 'interaction_goal',
+      label: 'What You Want',
+      directive: 'This is your hidden agenda entering this conversation. It shapes what you are listening for and what will make you engage more or less.',
+    },
+    {
+      key: 'consistency_anchors',
+      label: 'Always True',
+      directive: 'These behaviours never change regardless of mood, pressure, or circumstances. They are non-negotiable constants that make you recognisable across the entire conversation.',
+    },
+  ]
+
+  const lines = []
+  for (const { key, label, directive } of FIELDS) {
+    const value = String(psychology[key] ?? '').trim()
+    if (!value) continue
+    lines.push(`${label}: ${value}`)
+    lines.push(`  → ${directive}`)
+  }
+
+  if (!lines.length) return null
+
+  return [
+    `DEEP CHARACTER PSYCHOLOGY (read this carefully — this defines who this character is at their core):`,
+    `These are not suggestions. They are the psychological truth of this character.`,
+    `Every response you give must be consistent with all of these dimensions simultaneously.`,
+    ``,
+    ...lines,
+  ].join('\n')
+}
+
 export function buildCharacterBehaviorPrompt(character, scenario, ctx = {}) {
   const warmth = bucket(character?.warmth)
   const directness = bucket(character?.directness)
@@ -387,6 +465,10 @@ ENDING RULES (VERY IMPORTANT):
     `Scenario: "${scenario?.title || 'Unknown scenario'}"`,
     scenario?.description ? `Full scenario context: ${scenario.description}` : null,
     ``,
+
+    // ── Deep psychology (10-dimension profile) ────────────────────────────────
+    buildPsychologyBlock(character?.psychology),
+    character?.psychology && Object.values(character.psychology).some(v => String(v ?? '').trim()) ? `` : null,
 
     // ── Responsibility position ───────────────────────────────────────────────
     responsibilityBlock,

@@ -298,15 +298,28 @@ export function buildModelResponsePrompt(scenario, character, conversation, judg
   const transcript = Array.isArray(conversation) ? conversation : []
   const citedIndices = (judgeResult?.reason_citations ?? []).flat()
 
-  const weakestMessages = citedIndices
+  const getText = (msg) => String(msg?.content ?? msg?.text ?? '').trim()
+  const hasUserText = (msg) => msg?.role === 'user' && getText(msg).length > 0
+
+  const fallbackUserIndices = transcript
+    .map((msg, i) => (hasUserText(msg) ? i : null))
+    .filter((i) => i !== null)
+
+  const weakestUserIndices =
+    citedIndices.length > 0 ? citedIndices : fallbackUserIndices.slice(-1)
+
+  const weakestMessages = weakestUserIndices
     .map((i) => ({ index: i, message: transcript[i] }))
-    .filter(({ message }) => message?.role === 'user')
+    .filter(({ message }) => hasUserText(message))
     .slice(0, 2)
 
   const conversationText = transcript
     .map(
-      (msg, i) =>
-        `[${i}] ${msg.role === 'user' ? 'User' : character?.name ?? 'Character'}: ${msg.content}`
+      (msg, i) => {
+        const speaker = msg?.role === 'user' ? 'User' : character?.name ?? 'Character'
+        const text = getText(msg)
+        return `[${i}] ${speaker}: ${text.length > 0 ? text : '(empty message)'}`
+      }
     )
     .join('\n')
 
@@ -326,13 +339,18 @@ JUDGE FEEDBACK SUMMARY:
 - Cited problem messages (by index): ${citedIndices.join(', ')}
 
 WEAKEST USER MESSAGES:
-${weakestMessages.map(({ index, message }) => `[${index}] "${message.content}"`).join('\n')}
+${weakestMessages.map(({ index, message }) => `[${index}] "${getText(message)}"`).join('\n')}
 
 Your job is to produce two things:
 
 1. REWRITE: Take the single weakest user message and rewrite it as an A-tier response. Include a brief explanation (2-3 sentences) of what makes the rewrite better - be specific, not generic.
+If no weakest message is listed above, choose the most recent NON-EMPTY user message from the full conversation.
+If there is no non-empty user message at all, return:
+"original": "", "improved": "", "explanation": "No user message available to rewrite."
 
-2. IDEAL EXCHANGE: Write a complete ideal version of this conversation from start to finish (4-8 messages total). The user should demonstrate strong ${scenario?.title ?? 'social'} skills throughout. Keep it natural, not robotic or overly perfect.
+2. IDEAL EXCHANGE: Write a complete ideal version of THIS SAME conversation from start to finish (4-8 messages total). It must stay grounded in the actual situation, topic, and intent from the full conversation above. Do not invent a new scenario. Keep the same character and user goal, just improve how the user responds. Keep it natural, not robotic or overly perfect.
+Use ONLY details present in the full conversation. Do NOT introduce new facts or events.
+Never output "undefined" or "null" as message text.
 
 Respond ONLY with valid JSON. No preamble, no markdown, no backticks. Use this exact structure:
 {
