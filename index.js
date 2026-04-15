@@ -28,9 +28,37 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 dotenv.config({ path: path.resolve(__dirname, ".env") });
 
+function parsePositiveInt(value, fallback) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return fallback;
+  return Math.floor(n);
+}
+
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
+app.use((req, res, next) => {
+  const routeKey = `${req.method} ${req.path}`;
+  const stats = ensureRouteMetric(routeKey);
+  const startedAt = Date.now();
+  stats.active += 1;
+  stats.peakActive = Math.max(stats.peakActive, stats.active);
+
+  res.on("finish", () => {
+    const elapsedMs = Date.now() - startedAt;
+    stats.active = Math.max(0, stats.active - 1);
+    stats.total += 1;
+    stats.lastMs = elapsedMs;
+    stats.lastStatus = res.statusCode;
+    stats.avgMs =
+      stats.total === 1
+        ? elapsedMs
+        : ((stats.avgMs * (stats.total - 1)) + elapsedMs) / stats.total;
+    if (res.statusCode >= 500) stats.errors += 1;
+  });
+
+  next();
+});
 
 const PORT = process.env.PORT || 8787;
 const DEFAULT_GROQ_BASE_URL = process.env.GROQ_BASE_URL || "https://api.groq.com/openai/v1";
@@ -56,6 +84,128 @@ const {
   supabaseUrl: SUPABASE_URL,
   supabaseAnonKey: SUPABASE_ANON_KEY,
   supabaseServiceRoleKey: SUPABASE_SERVICE_ROLE_KEY,
+});
+const BRIDGE_STARTED_AT = new Date().toISOString();
+const MAX_CONCURRENT_LLM_REQUESTS = parsePositiveInt(process.env.BRIDGE_MAX_CONCURRENT_LLM, 80);
+const bridgeMetrics = {
+  requests: {},
+  llm: {
+    limit: MAX_CONCURRENT_LLM_REQUESTS,
+    active: 0,
+    peakActive: 0,
+    accepted: 0,
+    rejected: 0,
+    completed: 0,
+    failed: 0,
+    avgMs: 0,
+    lastMs: 0
+  }
+};
+
+function ensureRouteMetric(key) {
+  if (!bridgeMetrics.requests[key]) {
+    bridgeMetrics.requests[key] = {
+      active: 0,
+      peakActive: 0,
+      total: 0,
+      errors: 0,
+      avgMs: 0,
+      lastMs: 0,
+      lastStatus: null
+    };
+  }
+  return bridgeMetrics.requests[key];
+}
+
+function snapshotBridgeMetrics() {
+  const routeEntries = Object.entries(bridgeMetrics.requests)
+    .sort((a, b) => b[1].total - a[1].total)
+    .slice(0, 12)
+    .map(([route, stats]) => ({
+      route,
+      active: stats.active,
+      peak_active: stats.peakActive,
+      total: stats.total,
+      errors: stats.errors,
+      avg_ms: Math.round(stats.avgMs),
+      last_ms: stats.lastMs,
+      last_status: stats.lastStatus
+    }));
+
+  return {
+    started_at: BRIDGE_STARTED_AT,
+    now: new Date().toISOString(),
+    llm: {
+      limit: bridgeMetrics.llm.limit,
+      active: bridgeMetrics.llm.active,
+      peak_active: bridgeMetrics.llm.peakActive,
+      accepted: bridgeMetrics.llm.accepted,
+      rejected: bridgeMetrics.llm.rejected,
+      completed: bridgeMetrics.llm.completed,
+      failed: bridgeMetrics.llm.failed,
+      avg_ms: Math.round(bridgeMetrics.llm.avgMs),
+      last_ms: bridgeMetrics.llm.lastMs
+    },
+    routes: routeEntries
+  };
+}
+
+async function withLlmCapacity(label, task) {
+  const llm = bridgeMetrics.llm;
+  if (llm.active >= llm.limit) {
+    llm.rejected += 1;
+    const error = new Error(
+      `Bridge overloaded: concurrent LLM limit (${llm.limit}) reached for ${label}`
+    );
+    error.statusCode = 503;
+    error.code = "BRIDGE_OVERLOADED";
+    throw error;
+  }
+
+  llm.active += 1;
+  llm.accepted += 1;
+  llm.peakActive = Math.max(llm.peakActive, llm.active);
+  const startedAt = Date.now();
+
+  try {
+    return await task();
+  } catch (error) {
+    llm.failed += 1;
+    throw error;
+  } finally {
+    const elapsedMs = Date.now() - startedAt;
+    llm.completed += 1;
+    llm.lastMs = elapsedMs;
+    llm.avgMs =
+      llm.completed === 1
+        ? elapsedMs
+        : ((llm.avgMs * (llm.completed - 1)) + elapsedMs) / llm.completed;
+    llm.active = Math.max(0, llm.active - 1);
+  }
+}
+
+app.get("/healthz", (_req, res) => {
+  const saturated = bridgeMetrics.llm.active >= bridgeMetrics.llm.limit;
+  return res.status(saturated ? 429 : 200).json({
+    ok: !saturated,
+    service: "blur-ai-bridge",
+    started_at: BRIDGE_STARTED_AT,
+    llm_active: bridgeMetrics.llm.active,
+    llm_limit: bridgeMetrics.llm.limit
+  });
+});
+
+app.get("/readyz", (_req, res) => {
+  return res.status(200).json({
+    ok: true,
+    has_groq_key: Boolean(process.env.GROQ_API_KEY),
+    has_supabase_config: hasSupabaseConfig(),
+    has_supabase_admin_config: hasSupabaseAdminConfig()
+  });
+});
+
+app.get("/metricsz", (_req, res) => {
+  return res.json(snapshotBridgeMetrics());
 });
 
 function getGroqKey() {
@@ -446,79 +596,81 @@ function judgeUserPrompt({ scenario, character, compactMessages, userProfile }) 
 }
 
 async function callJudgeLLM({ scenario, character, messages, userProfile }) {
-  const totalMessages = normalizeTranscript(messages).length;
-  const primaryProfile = buildJudgeCompactionProfile(totalMessages, false);
-  const retryProfile = buildJudgeCompactionProfile(totalMessages, true);
-  const attempts = [
-    {
-      compaction: primaryProfile,
-      options: {
-        temperature: 0,
-        top_p: 0.9,
-        num_predict: computeJudgeNumPredict(totalMessages, false)
-      },
-      responseFormat: { type: "json_object" }
-    },
-    {
-      compaction: retryProfile,
-      options: {
-        temperature: 0,
-        top_p: 0.9,
-        num_predict: computeJudgeNumPredict(totalMessages, true)
-      },
-      responseFormat: undefined
-    }
-  ];
-
-  let lastError = null;
-
-  for (let i = 0; i < attempts.length; i += 1) {
-    const attempt = attempts[i];
-    const compactMessages = compactJudgeMessages(messages, attempt.compaction);
-    const judgeMessages = [
-      { role: "system", content: judgeSystemPrompt() },
+  return withLlmCapacity("judge", async () => {
+    const totalMessages = normalizeTranscript(messages).length;
+    const primaryProfile = buildJudgeCompactionProfile(totalMessages, false);
+    const retryProfile = buildJudgeCompactionProfile(totalMessages, true);
+    const attempts = [
       {
-        role: "user",
-        content: judgeUserPrompt({ scenario, character, compactMessages, userProfile })
+        compaction: primaryProfile,
+        options: {
+          temperature: 0,
+          top_p: 0.9,
+          num_predict: computeJudgeNumPredict(totalMessages, false)
+        },
+        responseFormat: { type: "json_object" }
+      },
+      {
+        compaction: retryProfile,
+        options: {
+          temperature: 0,
+          top_p: 0.9,
+          num_predict: computeJudgeNumPredict(totalMessages, true)
+        },
+        responseFormat: undefined
       }
     ];
 
-    const response = await groqChatCompletions({
-      model: DEFAULT_GROQ_JUDGE_MODEL,
-      messages: judgeMessages,
-      options: attempt.options,
-      stream: false,
-      responseFormat: attempt.responseFormat
-    });
+    let lastError = null;
 
-    const text = await response.text().catch(() => "");
-    if (!response.ok) {
-      const err = new Error(`groq_error:${response.status} ${text}`);
-      // Always retry once without response_format on any non-OK response.
-      // Some Groq models reject response_format even if JSON is otherwise fine.
-      const retriable = i < attempts.length - 1;
-      if (retriable) {
-        lastError = err;
-        continue;
+    for (let i = 0; i < attempts.length; i += 1) {
+      const attempt = attempts[i];
+      const compactMessages = compactJudgeMessages(messages, attempt.compaction);
+      const judgeMessages = [
+        { role: "system", content: judgeSystemPrompt() },
+        {
+          role: "user",
+          content: judgeUserPrompt({ scenario, character, compactMessages, userProfile })
+        }
+      ];
+
+      const response = await groqChatCompletions({
+        model: DEFAULT_GROQ_JUDGE_MODEL,
+        messages: judgeMessages,
+        options: attempt.options,
+        stream: false,
+        responseFormat: attempt.responseFormat
+      });
+
+      const text = await response.text().catch(() => "");
+      if (!response.ok) {
+        const err = new Error(`groq_error:${response.status} ${text}`);
+        // Always retry once without response_format on any non-OK response.
+        // Some Groq models reject response_format even if JSON is otherwise fine.
+        const retriable = i < attempts.length - 1;
+        if (retriable) {
+          lastError = err;
+          continue;
+        }
+        throw err;
       }
-      throw err;
+
+      try {
+        const data = JSON.parse(text);
+        const out = data?.choices?.[0]?.message?.content ?? "";
+        return safeParseModelJson(out);
+      } catch (parseErr) {
+        const retriable = i < attempts.length - 1;
+        if (retriable) {
+          lastError = parseErr;
+          continue;
+        }
+        throw parseErr;
+      }
     }
 
-    try {
-      const data = JSON.parse(text);
-      const out = data?.choices?.[0]?.message?.content ?? "";
-      return safeParseModelJson(out);
-    } catch (parseErr) {
-      const retriable = i < attempts.length - 1;
-      if (retriable) {
-        lastError = parseErr;
-        continue;
-      }
-      throw parseErr;
-    }
-  }
-
-  throw lastError || new Error("Judge model failed after retries");
+    throw lastError || new Error("Judge model failed after retries");
+  });
 }
 
 function chatSystemPrompt({ scenario, character, difficultyCtx, userProfile }) {
@@ -1012,18 +1164,20 @@ app.post("/model-response", async (req, res) => {
       judgeResult
     );
 
-    const response = await groqChatCompletions({
-      model: DEFAULT_GROQ_CHAT_MODEL,
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: "Generate the rewrite and ideal exchange now." }
-      ],
-      options: {
-        temperature: 0.7,
-        num_predict: 1200
-      },
-      responseFormat: { type: "json_object" }
-    });
+    const response = await withLlmCapacity("model-response", () =>
+      groqChatCompletions({
+        model: DEFAULT_GROQ_CHAT_MODEL,
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: "Generate the rewrite and ideal exchange now." }
+        ],
+        options: {
+          temperature: 0.7,
+          num_predict: 1200
+        },
+        responseFormat: { type: "json_object" }
+      })
+    );
 
     const text = await response.text().catch(() => "");
     let data = null;
@@ -1050,7 +1204,7 @@ app.post("/model-response", async (req, res) => {
     });
   } catch (err) {
     console.error("[/model-response] error:", err?.message ?? String(err));
-    return res.status(500).json({
+    return res.status(err?.statusCode ?? 500).json({
       error: "Failed to generate model response",
       detail: err?.message ?? String(err)
     });
@@ -1104,21 +1258,23 @@ app.post("/detect-weak-spots", async (req, res) => {
     }
 
     const systemPrompt = buildWeakSpotPrompt(history);
-    const response = await groqChatCompletions({
-      model: DEFAULT_GROQ_CHAT_MODEL,
-      messages: [
-        { role: "system", content: systemPrompt },
-        {
-          role: "user",
-          content: "Analyse this user's session history and return their weak spots."
-        }
-      ],
-      options: {
-        temperature: 0.4,
-        num_predict: 800
-      },
-      responseFormat: { type: "json_object" }
-    });
+    const response = await withLlmCapacity("weak-spots", () =>
+      groqChatCompletions({
+        model: DEFAULT_GROQ_CHAT_MODEL,
+        messages: [
+          { role: "system", content: systemPrompt },
+          {
+            role: "user",
+            content: "Analyse this user's session history and return their weak spots."
+          }
+        ],
+        options: {
+          temperature: 0.4,
+          num_predict: 800
+        },
+        responseFormat: { type: "json_object" }
+      })
+    );
 
     const text = await response.text().catch(() => "");
     let data = null;
@@ -1158,7 +1314,7 @@ app.post("/detect-weak-spots", async (req, res) => {
     return res.json({ weak_spots: weakSpots });
   } catch (err) {
     console.error("[/detect-weak-spots] error:", err?.message ?? String(err));
-    return res.status(500).json({
+    return res.status(err?.statusCode ?? 500).json({
       error: "Failed to detect weak spots",
       detail: err?.message ?? String(err)
     });
@@ -1315,16 +1471,18 @@ Output format (JSON only — no extra text):
   ]
 }`;
 
-    const response = await groqChatCompletions({
-      model: DEFAULT_GROQ_JUDGE_MODEL,
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user",   content: userPrompt   }
-      ],
-      options: { temperature: 0.4, top_p: 0.9, num_predict: 700 },
-      stream: false,
-      responseFormat: { type: "json_object" }
-    });
+    const response = await withLlmCapacity("generate-challenges", () =>
+      groqChatCompletions({
+        model: DEFAULT_GROQ_JUDGE_MODEL,
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user",   content: userPrompt   }
+        ],
+        options: { temperature: 0.4, top_p: 0.9, num_predict: 700 },
+        stream: false,
+        responseFormat: { type: "json_object" }
+      })
+    );
 
     const rawText = await response.text().catch(() => "");
     if (!response.ok) throw new Error(`groq_error:${response.status} ${rawText}`);
@@ -1423,7 +1581,7 @@ Output format (JSON only — no extra text):
 
   } catch (err) {
     console.error("[/generate-challenges] error:", err?.message ?? String(err));
-    return res.status(500).json({ ok: false, error: "Failed to generate challenges", detail: err?.message ?? String(err) });
+    return res.status(err?.statusCode ?? 500).json({ ok: false, error: "Failed to generate challenges", detail: err?.message ?? String(err) });
   }
 });
 
@@ -1638,7 +1796,7 @@ app.post("/finalize-session", async (req, res) => {
       new_rank: String(rewardsRow?.new_rank ?? rewardsRow?.rank ?? fallbackRank)
     });
   } catch (e) {
-    return res.status(500).json({
+    return res.status(e?.statusCode ?? 500).json({
       ok: false,
       _error: e?.message ?? String(e)
     });
@@ -1675,12 +1833,14 @@ app.post("/api/chat", async (req, res) => {
     ]);
 
     if (!stream) {
-      const response = await groqChatCompletions({
-        model: DEFAULT_GROQ_CHAT_MODEL,
-        messages: payloadMessages,
-        options: merged,
-        stream: false
-      });
+      const response = await withLlmCapacity("api-chat", () =>
+        groqChatCompletions({
+          model: DEFAULT_GROQ_CHAT_MODEL,
+          messages: payloadMessages,
+          options: merged,
+          stream: false
+        })
+      );
 
       const text = await response.text().catch(() => "");
       if (!response.ok) return res.status(response.status).json({ error: `groq_error:${response.status}`, detail: text });
@@ -1693,74 +1853,79 @@ app.post("/api/chat", async (req, res) => {
       });
     }
 
-    res.setHeader("Content-Type", "text/event-stream");
-    res.setHeader("Cache-Control", "no-cache");
-    res.setHeader("Connection", "keep-alive");
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.flushHeaders?.();
+    return await withLlmCapacity("api-chat-stream", async () => {
+      res.setHeader("Content-Type", "text/event-stream");
+      res.setHeader("Cache-Control", "no-cache");
+      res.setHeader("Connection", "keep-alive");
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      res.flushHeaders?.();
 
-    const response = await groqChatCompletions({
-      model: DEFAULT_GROQ_CHAT_MODEL,
-      messages: payloadMessages,
-      options: merged,
-      stream: true
-    });
+      const response = await groqChatCompletions({
+        model: DEFAULT_GROQ_CHAT_MODEL,
+        messages: payloadMessages,
+        options: merged,
+        stream: true
+      });
 
-    if (!response.ok || !response.body) {
-      const t = await response.text().catch(() => "");
-      sseWrite(res, { type: "error", error: `groq_error:${response.status}`, detail: t });
+      if (!response.ok || !response.body) {
+        const t = await response.text().catch(() => "");
+        sseWrite(res, { type: "error", error: `groq_error:${response.status}`, detail: t });
+        sseWrite(res, { type: "done", done: true });
+        return res.end();
+      }
+
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      for await (const chunk of response.body) {
+        buffer += decoder.decode(chunk, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith("data:")) continue;
+
+          const raw = trimmed.replace(/^data:\s*/, "");
+          if (!raw || raw === "[DONE]") {
+            sseWrite(res, { type: "done", done: true });
+            return res.end();
+          }
+
+          let payload;
+          try {
+            payload = JSON.parse(raw);
+          } catch {
+            continue;
+          }
+
+          const delta = payload?.choices?.[0]?.delta?.content ?? "";
+          if (!delta) continue;
+
+          if (delta.includes(END_TOKEN)) {
+            const cleaned = delta.replaceAll(END_TOKEN, "");
+            if (cleaned) sseWrite(res, { delta: cleaned });
+            sseWrite(res, { done: true, ended: true });
+            return res.end();
+          }
+
+          sseWrite(res, { delta });
+        }
+      }
+
       sseWrite(res, { type: "done", done: true });
       return res.end();
-    }
-
-    const decoder = new TextDecoder();
-    let buffer = "";
-
-    for await (const chunk of response.body) {
-      buffer += decoder.decode(chunk, { stream: true });
-      const lines = buffer.split("\n");
-      buffer = lines.pop() || "";
-
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed.startsWith("data:")) continue;
-
-        const raw = trimmed.replace(/^data:\s*/, "");
-        if (!raw || raw === "[DONE]") {
-          sseWrite(res, { type: "done", done: true });
-          return res.end();
-        }
-
-        let payload;
-        try {
-          payload = JSON.parse(raw);
-        } catch {
-          continue;
-        }
-
-        const delta = payload?.choices?.[0]?.delta?.content ?? "";
-        if (!delta) continue;
-
-        if (delta.includes(END_TOKEN)) {
-          const cleaned = delta.replaceAll(END_TOKEN, "");
-          if (cleaned) sseWrite(res, { delta: cleaned });
-          sseWrite(res, { done: true, ended: true });
-          return res.end();
-        }
-
-        sseWrite(res, { delta });
-      }
-    }
-
-    sseWrite(res, { type: "done", done: true });
-    return res.end();
+    });
   } catch (e) {
+    if (!res.headersSent) {
+      return res.status(e?.statusCode ?? 500).json({ error: e?.message ?? String(e) });
+    }
     try {
       sseWrite(res, { type: "error", error: e?.message ?? String(e) });
       sseWrite(res, { type: "done", done: true });
       return res.end();
     } catch {
-      return res.status(500).json({ error: e?.message ?? String(e) });
+      return res.end();
     }
   }
 });
@@ -1780,19 +1945,21 @@ app.post("/reply", async (req, res) => {
       ...(messages ?? [])
     ]);
 
-    const response = await groqChatCompletions({
-      model: DEFAULT_GROQ_CHAT_MODEL,
-      messages: payloadMessages,
-      options: mergedOptions(options),
-      stream: false
-    });
+    const response = await withLlmCapacity("reply", () =>
+      groqChatCompletions({
+        model: DEFAULT_GROQ_CHAT_MODEL,
+        messages: payloadMessages,
+        options: mergedOptions(options),
+        stream: false
+      })
+    );
 
     const text = await response.text().catch(() => "");
     if (!response.ok) throw new Error(`groq_error:${response.status} ${text}`);
     const data = JSON.parse(text);
     return res.json({ text: data?.choices?.[0]?.message?.content ?? "" });
   } catch (e) {
-    return res.status(500).json({ text: "...", _error: e?.message ?? String(e) });
+    return res.status(e?.statusCode ?? 500).json({ text: "...", _error: e?.message ?? String(e) });
   }
 });
 
