@@ -218,6 +218,15 @@ function mergedOptions(options) {
   return { ...DEFAULT_CHAT_OPTIONS, ...(options || {}) };
 }
 
+function toGroqResponseFormat(format) {
+  if (!format) return null;
+  const normalized = String(format).trim().toLowerCase();
+  if (normalized === "json" || normalized === "json_object") {
+    return { type: "json_object" };
+  }
+  return null;
+}
+
 function scoreJudgeLine(text = "") {
   const t = String(text ?? "");
   const lower = t.toLowerCase();
@@ -1805,7 +1814,18 @@ app.post("/finalize-session", async (req, res) => {
 
 app.post("/api/chat", async (req, res) => {
   try {
-    const { scenario, character, difficultyCtx, userProfile, messages, options, stream } = req.body ?? {};
+    const {
+      scenario,
+      character,
+      difficultyCtx,
+      userProfile,
+      messages,
+      options,
+      stream,
+      model,
+      raw,
+      format
+    } = req.body ?? {};
 
     const modResult = moderateMessage(lastUserText(messages));
     if (modResult.blocked) {
@@ -1827,18 +1847,23 @@ app.post("/api/chat", async (req, res) => {
     }
 
     const merged = mergedOptions(options);
-    const payloadMessages = toGroqMessages([
-      { role: "system", content: chatSystemPrompt({ scenario, character, difficultyCtx, userProfile }) },
-      ...(messages ?? [])
-    ]);
+    const payloadMessages = raw
+      ? toGroqMessages(messages ?? [])
+      : toGroqMessages([
+          { role: "system", content: chatSystemPrompt({ scenario, character, difficultyCtx, userProfile }) },
+          ...(messages ?? [])
+        ]);
+    const responseFormat = toGroqResponseFormat(format);
+    const selectedModel = typeof model === "string" && model.trim() ? model.trim() : DEFAULT_GROQ_CHAT_MODEL;
 
     if (!stream) {
       const response = await withLlmCapacity("api-chat", () =>
         groqChatCompletions({
-          model: DEFAULT_GROQ_CHAT_MODEL,
+          model: selectedModel,
           messages: payloadMessages,
           options: merged,
-          stream: false
+          stream: false,
+          responseFormat
         })
       );
 
@@ -1861,7 +1886,7 @@ app.post("/api/chat", async (req, res) => {
       res.flushHeaders?.();
 
       const response = await groqChatCompletions({
-        model: DEFAULT_GROQ_CHAT_MODEL,
+        model: selectedModel,
         messages: payloadMessages,
         options: merged,
         stream: true
